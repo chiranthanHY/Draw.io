@@ -1,142 +1,494 @@
-import express from "express";
-import jwt from "jsonwebtoken";
-import { JWT_SECRET } from '@repo/backend-common/config';
-import { middleware } from "./middleware";
-import { CreateUserSchema, SigninSchema, CreateRoomSchema } from "@repo/common/types";
-import { prismaClient } from "@repo/db/client";
+import express, { json, Request, Response } from 'express';
+import cookieParser from 'cookie-parser';
+import { authenticator } from './config';
+import { requiredBodySignup, requiredBodySignin, createRoomSchema } from '@repo/fullstack-common/types';
+import { prismaClient as db } from '@repo/db/client';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import cors from 'cors';
+import helmet from 'helmet';
+import passport from 'passport';
+import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
+import { Strategy as GithubStrategy } from 'passport-github2';
+import env from 'dotenv';
 
+env.config();
+
+export const HTTP_URL = process.env.HTTP_URL || 'http://localhost:4000';
+export const WS_URL = process.env.WS_URL || 'http://localhost:4000/ws';
+export const FE_URL = process.env.FE_URL || 'http://localhost:3000';
+export const JWT_SECRET = process.env.JWT_SECRET as string;
+
+if (!JWT_SECRET) {
+    console.error('JWT_SECRET is not set in the environment variables.');
+    throw new Error('JWT_SECRET is required but not set.');
+}
+export const EXP_TIME = process.env.EXP_TIME || '1h';
+// prod
+const cookieConfig = { httpOnly: true, secure: false, sameSite: 'lax' as const, maxAge: (1000 * 60 * 60 * 24 * 4) };
+//dev
+//const cookieConfig = { httpOnly: true, secure: true, sameSite: 'lax' as const, maxAge: (1000 * 60 * 60 * 24 * 4) };
 const app = express();
-app.use(express.json());
 
+app.use(helmet());
+app.use(json());
+app.use(cookieParser());
+app.use(cors({
+    origin: ['https://doodleart.live', 'http://localhost:3000', 'http://localhost:3001'], // Your frontend URL
+    credentials: true,
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
-app.post("/signup", async (req, res) => {
+app.use(passport.initialize());
 
-    const parsedData = CreateUserSchema.safeParse(req.body);
-    if (!parsedData.success) {
-        console.log(parsedData.error);
-        res.json({
-            message: "Incorrect inputs"
-        })
+interface authRequest extends Request {
+    user: {
+        id: string;
+        nfl: string;
+    },
+    cookies: {
+        __uIt: string;
+    }
+}
+
+function generateSecureString(length: number) {
+    const array = new Uint8Array(length);
+    crypto.getRandomValues(array);
+    return Array.from(array, byte => byte.toString(36)).join('').substring(0, length);
+}
+
+// 🔐 Auth Related Endpoints
+// ------------------------------------------------------------------------------------------------------------------------------
+// Sign-Up endpoint
+app.post('/api/v1/auth/signup', async (req, res) => {
+
+    // input validation by zod
+    const result = requiredBodySignup.safeParse(req.body);
+    if (!result.success) {
+        const errors = result.error.issues[0]?.message;
+        res.status(400).json({
+            message: errors
+        });
         return;
     }
+
+    // Main Logic
     try {
-        const user = await prismaClient.user.create({
-            data: {
-                email: parsedData.data?.username,
-                // TODO: Hash the pw
-                password: parsedData.data.password,
-                name: parsedData.data.name
+        // check if email exist??
+        const isEmailExist = (await db.user.findUnique({
+            where: {
+                email: result.data.email
+            },
+            select: {
+                email: true
             }
-        })
-        res.json({
-            userId: user.id
-        })
-    } catch(e) {
-        res.status(411).json({
-            message: "User already exists with this username"
-        })
-    }
-})
+        }))?.email
 
-app.post("/signin", async (req, res) => {
-    const parsedData = SigninSchema.safeParse(req.body);
-    if (!parsedData.success) {
-        res.json({
-            message: "Incorrect inputs"
-        })
-        return;
-    }
-
-    // TODO: Compare the hashed pws here
-    const user = await prismaClient.user.findFirst({
-        where: {
-            email: parsedData.data.username,
-            password: parsedData.data.password
+        if (isEmailExist) {
+            res.status(400).json({ message: "User Already Exist! Go to Login!" });
+            return;
         }
-    })
 
-    if (!user) {
-        res.status(403).json({
-            message: "Not authorized"
-        })
-        return;
-    }
+        //Hash passwords
+        const hashedPassword = await bcrypt.hash(result.data.password, 10);
 
-    const token = jwt.sign({
-        userId: user?.id
-    }, JWT_SECRET);
-
-    res.json({
-        token
-    })
-})
-
-app.post("/room", middleware, async (req, res) => {
-    const parsedData = CreateRoomSchema.safeParse(req.body);
-    if (!parsedData.success) {
-        res.json({
-            message: "Incorrect inputs"
-        })
-        return;
-    }
-    // @ts-ignore: TODO: Fix this
-    const userId = req.userId;
-
-    try {
-        const room = await prismaClient.room.create({
+        // Enter into DB
+        const userId = (await db.user.create({
             data: {
-                slug: parsedData.data.name,
-                adminId: userId
+                email: result.data.email,
+                name: result.data.username,
+                password: hashedPassword
+            },
+            select: {
+                id: true
             }
-        })
+        })).id;
 
-        res.json({
-            roomId: room.id
-        })
-    } catch(e) {
-        res.status(411).json({
-            message: "Room already exists with this name"
-        })
+        // User registered successfully
+        res.status(200).json({
+            message: "Successful Registration!"
+        });
+
+    } catch (error) {
+        console.error("Signin Error:", error);
+        res.status(500).json({ message: "Internal Server Error!", error: error instanceof Error ? error.message : "Unknown error" });
     }
-})
+});
 
-app.get("/chats/:roomId", async (req, res) => {
+// Sign-In endpoint
+app.post('/api/v1/auth/signin', async (req, res) => {
+
+    // Input Validation by zod
+    const result = requiredBodySignin.safeParse(req.body);
+    if (!result.success) {
+        const errors = result.error.issues[0]?.message;
+        res.status(400).json({ message: errors });
+        return;
+    }
+
     try {
-        const roomId = Number(req.params.roomId);
-        console.log(req.params.roomId);
-        const messages = await prismaClient.chat.findMany({
+        // Check for user exist or not
+        const userData = await db.user.findUnique({
+            where: {
+                email: result.data.email
+            },
+            select: {
+                id: true,
+                email: true,
+                name: true,
+                password: true
+            }
+        });
+
+        if (!userData?.email) {
+            res.status(400).json({ message: "User doesn't exist! Please Signup first!" });
+            return;
+        }
+
+        //If password is valid
+        const isPasswordValid = await bcrypt.compare(result.data.password, userData.password);
+        if (!isPasswordValid) {
+            res.status(400).json({ message: "Incorrect Password!" });
+            return;
+        }
+
+const token = jwt.sign({ userId: userData.id, nfl: userData.name[0] }, JWT_SECRET!, { expiresIn: EXP_TIME } as jwt.SignOptions);
+console.log('Generated token:', token);
+console.log('Using secret for signing:', JWT_SECRET);
+console.log('Generated token:', token);
+        res.status(200).cookie('__uIt', token, cookieConfig);
+        console.log('Cookie set with token:', token); // Added logging
+        res.json({ message: "Successful Login!", name: userData.name });
+    } catch (error) {
+        res.status(500).json({ message: "Internal Server Error!" });
+    }
+});
+
+
+app.get('/api/v1/dashboard', authenticator, async (req: Request, res: Response) => {
+    try {
+        // Sample data for the dashboard
+        const dashboardData = {
+            message: "Welcome to the Dashboard!",
+            userCount: 100, // Example data
+            activeRooms: 5, // Example data
+        };
+        res.status(200).json(dashboardData);
+    } catch (error) {
+        res.status(500).json({ message: "Internal Server Error!" });
+    }
+});
+// ------------------------------------------------------------------------------------------------------------------------------
+
+// Google OAuth
+if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+    app.get('/api/v1/auth/google',
+        passport.authenticate('google', { scope: ['profile', 'email'] })
+    );
+
+    passport.use(new GoogleStrategy({
+        clientID: process.env.GOOGLE_CLIENT_ID,
+        clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+        callbackURL: `${HTTP_URL}/auth/google/return`,
+        scope: ['profile', 'email']
+    }, async (accessToken, refreshToken, profile, done) => {
+        try {
+            // Check if user exists in database
+            const userEmail = profile.emails && profile.emails[0]?.value;
+
+            if (!userEmail) {
+                return done(new Error('No email found in Google profile'), undefined);
+            }
+
+            let user = await db.user.findUnique({
+                where: {
+                    email: userEmail
+                }
+            });
+
+            if (!user) {
+                // Create new user if they don't exist
+                user = await db.user.create({
+                    data: {
+                        email: userEmail,
+                        name: profile.displayName || 'Google User',
+                        password: await bcrypt.hash(Math.random().toString(36).slice(-10), 10),
+                        googleId: profile.id
+                    }
+                });
+            } else if (!user.googleId) {
+                // If user exists but doesn't have googleId, update their record
+                user = await db.user.update({
+                    where: { id: user.id },
+                    data: { googleId: profile.id }
+                });
+            }
+
+            return done(null, { id: user.id, email: user.email, nfl: user.name[0] });
+        } catch (error) {
+            return done(error, undefined);
+        }
+    }));
+
+    app.get('/auth/google/return', (req, res, next) => {
+        if (req.query.error) {
+            return res.redirect(`${FE_URL}/signin`);
+        }
+        passport.authenticate('google', { session: false, failureRedirect: `${FE_URL}/signin` })(req, res, next)
+    },
+        (req, res) => {
+            try {
+                const user = req.user as { id: string; email: string; nfl: string };
+                const token = jwt.sign({ userId: user.id, nfl: user.nfl }, JWT_SECRET!, { expiresIn: EXP_TIME } as jwt.SignOptions);
+                res.cookie('__uIt', token, cookieConfig);
+
+                // ✅ Redirect to frontend
+                res.redirect(`${FE_URL}/dashboard`);
+            } catch (error) {
+                res.redirect(`${FE_URL}/signin`);
+            }
+        }
+    );
+} else {
+    console.log('Google OAuth disabled - missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET');
+}
+
+
+// GitHub OAuth
+if (process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET) {
+    app.get('/api/v1/auth/github',
+        passport.authenticate('github', { scope: ['user:email'] })
+    );
+
+    passport.use(new GithubStrategy({
+        clientID: process.env.GITHUB_CLIENT_ID,
+        clientSecret: process.env.GITHUB_CLIENT_SECRET,
+        callbackURL: `${HTTP_URL}/auth/github/return`,
+        scope: ['user:email'] // Request email access
+    }, async (accessToken: string, refreshToken: string, profile: any, done: any) => {
+        try {
+            // GitHub might not provide email in the main profile, so we need to fetch it
+            let userEmail = profile.emails && profile.emails[0]?.value;
+
+            // If no email in profile, we might need to fetch it separately using the access token
+            if (!userEmail && profile._json.email) {
+                userEmail = profile._json.email;
+            }
+
+            if (!userEmail) {
+                return done(new Error('No email found in GitHub profile'), undefined);
+            }
+
+            let user = await db.user.findUnique({
+                where: {
+                    email: userEmail
+                }
+            });
+
+            if (!user) {
+                // Create new user if they don't exist
+                user = await db.user.create({
+                    data: {
+                        email: userEmail,
+                        name: profile.displayName || profile.username || 'GitHub User',
+                        password: await bcrypt.hash(Math.random().toString(36).slice(-10), 10),
+                        githubId: profile.id
+                    }
+                });
+            } else if (!user.githubId) {
+                // If user exists but doesn't have githubId, update their record
+                user = await db.user.update({
+                    where: { id: user.id },
+                    data: { githubId: profile.id }
+                });
+            }
+
+            return done(null, { id: user.id, email: user.email, nfl: user.name[0] });
+        } catch (error) {
+            return done(error, undefined);
+        }
+    }));
+
+    app.get('/auth/github/return', (req, res, next) => {
+        if (req.query.error) {
+            return res.redirect(`${FE_URL}/signin`);
+        }
+        passport.authenticate('github', { session: false, failureRedirect: `${FE_URL}/signin` })(req, res, next)
+    },
+        (req, res) => {
+            try {
+                const user = req.user as { id: string, email: string, nfl: string };
+                const token = jwt.sign({ userId: user.id, nfl: user.nfl }, JWT_SECRET!, { expiresIn: EXP_TIME } as jwt.SignOptions);
+                res.cookie('__uIt', token, cookieConfig);
+                res.redirect(`${FE_URL}/dashboard`);
+            } catch (error) {
+                res.redirect(`${FE_URL}/signin`);
+            }
+        }
+    );
+} else {
+    console.log('GitHub OAuth disabled - missing GITHUB_CLIENT_ID or GITHUB_CLIENT_SECRET');
+}
+
+
+// 📝 CRUD Related Endpoints
+//----------------------------------------------------------------
+
+// Create-Room endpoint
+app.post('/api/v1/user/room', authenticator, async (req: Request, res: Response) => {
+
+    // Input Validation
+    const authreq = req as authRequest;
+    const result = createRoomSchema.safeParse(req.body);
+    if (!result.success) {
+        const errors = result.error.format();
+        //console.log(`Error during input valdation:${errors}`);
+        res.status(400).json({
+            message: "Input Wrong Format!",
+            error: errors
+        });
+        return;
+    }
+
+    // Create Room
+    try {
+        const userId = authreq.user.id;
+        // console.log(`user_Id : ${userId}`)
+        const colors = ["blue", "green", "purple", "orange", "red", "teal"];
+        const randomColor = colors[Math.floor(Math.random() * colors.length)];
+        const userData = (await db.room.create({
+            data: {
+                slug: result.data.name,
+                adminId: userId,
+                thumbnail: randomColor || "purple",
+                sharedKey: generateSecureString(16)
+            }
+        }))
+        res.status(200).json({ roomId: userData.id, roomName: userData.slug });
+    } catch (error) {
+        console.log(error);
+        res.status(500).json({ message: "Internal Server Error", err: error });
+    }
+});
+
+// Get room related chats by room Id
+app.get('/api/v1/user/chats/:roomId', authenticator, async (req, res) => {
+    const roomId = Number(req.params.roomId);
+    try {
+        const messages = await db.chat.findMany({
             where: {
                 roomId: roomId
             },
             orderBy: {
-                id: "desc"
+                createdAt: "asc"
             },
-            take: 1000
+            select: {
+                id: true,
+                message: true
+            },
+            take: 2000
         });
 
-        res.json({
-            messages
-        })
-    } catch(e) {
-        console.log(e);
-        res.json({
-            messages: []
-        })
+        res.status(200).json({ messages });
+    } catch (error) {
+        res.status(500).json({ message: "Internal Server Error!" });
     }
-    
-})
+});
 
-app.get("/room/:slug", async (req, res) => {
-    const slug = req.params.slug;
-    const room = await prismaClient.room.findFirst({
-        where: {
-            slug
+// Get all rooms of that particular user
+app.get('/api/v1/user/rooms/all', authenticator, async (req: Request, res: Response) => {
+    const authreq = req as authRequest;
+    const userId = authreq.user.id;
+    const nfl = authreq.user.nfl;
+    try {
+        const rooms = await db.room.findMany({
+            where: {
+                adminId: userId
+            },
+            select: {
+                id: true,
+                slug: true,
+                createdAt: true,
+                thumbnail: true,
+                sharedKey: true
+            }
+        });
+        // console.log(nfl);
+        res.status(200).json({ rooms: rooms, nfl: nfl });
+    } catch (error) {
+        // console.log("DB failure!");
+        res.status(500).json({ message: "Internal Server Error!" });
+    }
+});
+
+// Check Authorization status
+app.get('/api/v1/room/status/:roomId', authenticator, async (req, res) => {
+    // console.log("Endpoint hit!");
+    // console.log(req.query);
+    try {
+        // console.log("Inside Try!");
+        const authreq = req as authRequest;
+        const roomId = Number(req.params.roomId);
+        const sharedKey = (req.query.sharedKey);
+        // console.log(sharedKey);
+        if (sharedKey !== "null") {
+            // console.log("HI!");
+            const actualKey = await db.room.findUnique({
+                where: {
+                    id: roomId
+                },
+                select: {
+                    sharedKey: true
+                }
+            });
+
+            if (sharedKey === actualKey?.sharedKey) {
+                res.status(200).json({ check: true });
+                return;
+            }
+            res.status(403).json({ check: false });
+        } else {
+            // console.log("no shared key");
+            const data = await db.room.findUnique({
+                where: {
+                    id: roomId
+                }
+            });
+            // console.log(data);
+            // console.log(authreq.user);
+            if (data?.adminId === authreq.user.id) {
+                // console.log('Done!');
+                res.status(200).json({ check: true });
+                return;
+            }
+            res.status(403).json({ check: false });
         }
-    });
+    } catch (error) {
+        // console.log("Inside catch!");
+        res.status(403).json({ check: false });
+    }
+});
 
-    res.json({
-        room
-    })
+// ⏩ Logout endpoint
+app.post('/api/v1/auth/signout', (req: Request, res: Response) => {
+    try {
+        res.status(200).clearCookie('__uIt', cookieConfig).json({ flag: true, message: "Logout Successfully" });
+    } catch {
+        res.status(500).json({ flag: false, message: "Internal Server Error!" });
+    }
+});
+
+app.listen(4000, () => {
+    console.log(`Server is running at ${HTTP_URL}`);
 })
 
-app.listen(3001);
+
+// Scope of Improvements :-
+//=======================
+// - Room Permissions
+// - Rate Limiting
+// - Use Queues for performance
+// - Use better DS for User object
+
+
