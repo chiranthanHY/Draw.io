@@ -19,9 +19,6 @@ model User {
   password      String
   name          String
   photo         String?
-  googleId      String?    @unique
-  facebookId    String?    @unique
-  githubId      String?    @unique
   rooms         Room[]
   chats         Chat[]
 }
@@ -32,8 +29,6 @@ model Room {
   createdAt   DateTime  @default(now())
   adminId     String
   admin       User      @relation(fields: [adminId], references: [id])
-  thumbnail   String?
-  sharedKey   String?
   chats       Chat[]
 }
 
@@ -42,7 +37,6 @@ model Chat {
   roomId    Int
   message   String
   userId    String
-  createdAt DateTime  @default(now())
   room      Room      @relation(fields: [roomId], references: [id])
   user      User      @relation(fields: [userId], references: [id])
 }
